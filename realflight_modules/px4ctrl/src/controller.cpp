@@ -26,6 +26,7 @@ LinearControl::calculateControl(const Desired_State_t &des,
 {
   /* WRITE YOUR CODE HERE */
       //compute disired acceleration
+      //计算期望加速度，转换为油门的值
       Eigen::Vector3d des_acc(0.0, 0.0, 0.0);
       Eigen::Vector3d Kp,Kv;
       Kp << param_.gain.Kp0, param_.gain.Kp1, param_.gain.Kp2;
@@ -84,6 +85,7 @@ LinearControl::calculateControl(const Desired_State_t &des,
 
 /*
   compute throttle percentage 
+  通过加速度转化为油门百分比
 */
 double 
 LinearControl::computeDesiredCollectiveThrustSignal(
@@ -97,6 +99,7 @@ LinearControl::computeDesiredCollectiveThrustSignal(
   return throttle_percentage;
 }
 
+//推力估计模型，根据估计的加速度估计推力
 bool 
 LinearControl::estimateThrustModel(
     const Eigen::Vector3d &est_a,

@@ -34,6 +34,15 @@ PX4CtrlFSM::PX4CtrlFSM(Parameter_t &param_, LinearControl &controller_) : param(
 	-------- CMD_CTRL
 
 */
+/* 控制分为三阶段：
+	L1 手动控制
+	L2 自动悬停
+	L3 命令控制（轨迹跟踪）
+
+	L1 L2自动起飞和降落
+	L3 不允许自动降落
+*/
+
 
 void PX4CtrlFSM::process()
 {
@@ -50,16 +59,19 @@ void PX4CtrlFSM::process()
 	{
 		if (rc_data.enter_hover_mode) // Try to jump to AUTO_HOVER
 		{
+			//没有里程计信息，报错并退出
 			if (!odom_is_received(now_time))
 			{
 				ROS_ERROR("[px4ctrl] Reject AUTO_HOVER(L2). No odom!");
 				break;
 			}
+			//如果已经接收到控制指令，报错并退出
 			if (cmd_is_received(now_time))
 			{
 				ROS_ERROR("[px4ctrl] Reject AUTO_HOVER(L2). You are sending commands before toggling into AUTO_HOVER, which is not allowed. Stop sending commands now!");
 				break;
 			}
+			//如果速度过大，报错并退出
 			if (odom_data.v.norm() > 3.0)
 			{
 				ROS_ERROR("[px4ctrl] Reject AUTO_HOVER(L2). Odom_Vel=%fm/s, which seems that the locolization module goes wrong!", odom_data.v.norm());
@@ -67,12 +79,14 @@ void PX4CtrlFSM::process()
 			}
 
 			state = AUTO_HOVER;
-			controller.resetThrustMapping();
-			set_hov_with_odom();
-			toggle_offboard_mode(true);
+			controller.resetThrustMapping();//推力映射
+			set_hov_with_odom(); //设置悬停位置、方向（从里程计获取）
+			toggle_offboard_mode(true); //切换到offboard模式
 
 			ROS_INFO("\033[32m[px4ctrl] MANUAL_CTRL(L1) --> AUTO_HOVER(L2)\033[32m");
 		}
+
+		//L1收到起飞命令触发
 		else if (param.takeoff_land.enable && takeoff_land_data.triggered && takeoff_land_data.takeoff_land_cmd == quadrotor_msgs::TakeoffLand::TAKEOFF) // Try to jump to AUTO_TAKEOFF
 		{
 			if (!odom_is_received(now_time))
@@ -85,6 +99,7 @@ void PX4CtrlFSM::process()
 				ROS_ERROR("[px4ctrl] Reject AUTO_TAKEOFF. You are sending commands before toggling into AUTO_TAKEOFF, which is not allowed. Stop sending commands now!");
 				break;
 			}
+			//起飞时无人机应静止，里程计可能会有一点漂移
 			if (odom_data.v.norm() > 0.1)
 			{
 				ROS_ERROR("[px4ctrl] Reject AUTO_TAKEOFF. Odom_Vel=%fm/s, non-static takeoff is not allowed!", odom_data.v.norm());
@@ -95,8 +110,10 @@ void PX4CtrlFSM::process()
 				ROS_ERROR("[px4ctrl] Reject AUTO_TAKEOFF. land detector says that the drone is not landed now!");
 				break;
 			}
+			//收到遥控器指令
 			if (rc_is_received(now_time)) // Check this only if RC is connected.
 			{
+				//检查遥控器是否处于悬停模式以及能否接收控制指令
 				if (!rc_data.is_hover_mode || !rc_data.is_command_mode || !rc_data.check_centered())
 				{
 					ROS_ERROR("[px4ctrl] Reject AUTO_TAKEOFF. If you have your RC connected, keep its switches at \"auto hover\" and \"command control\" states, and all sticks at the center, then takeoff again.");
@@ -114,6 +131,8 @@ void PX4CtrlFSM::process()
 				}
 			}
 
+			//满足起飞条件，切换到自动起飞状态
+			//悬停和轨迹跟踪时推力选用模型不同
 			state = AUTO_TAKEOFF;
 			controller.resetThrustMapping();
 			set_start_pose_for_takeoff_land(odom_data);
@@ -123,6 +142,7 @@ void PX4CtrlFSM::process()
 				ros::Duration(0.01).sleep();
 				ros::spinOnce();
 			}
+			//如果使能auto_arm，px4进入ARM模式
 			if (param.takeoff_land.enable_auto_arm)
 			{
 				toggle_arm_disarm(true);
@@ -131,7 +151,7 @@ void PX4CtrlFSM::process()
 
 			ROS_INFO("\033[32m[px4ctrl] MANUAL_CTRL(L1) --> AUTO_TAKEOFF\033[32m");
 		}
-
+		//如果想要重启px4
 		if (rc_data.toggle_reboot) // Try to reboot. EKF2 based PX4 FCU requires reboot when its state estimator goes wrong.
 		{
 			if (state_data.current_state.armed)
@@ -144,37 +164,45 @@ void PX4CtrlFSM::process()
 
 		break;
 	}
-
+	//L2状态
 	case AUTO_HOVER:
 	{
+		//5通道不在最下面，或没有收到里程计信息
 		if (!rc_data.is_hover_mode || !odom_is_received(now_time))
 		{
 			state = MANUAL_CTRL;
+			//退出 offboard mode
 			toggle_offboard_mode(false);
 
 			ROS_WARN("[px4ctrl] AUTO_HOVER(L2) --> MANUAL_CTRL(L1)");
 		}
+		//6通道在最下面，且收到控制指令
 		else if (rc_data.is_command_mode && cmd_is_received(now_time))
 		{
 			if (state_data.current_state.mode == "OFFBOARD")
 			{
 				state = CMD_CTRL;
+				// 获取/position_cmd发来的数据作为des，获得位置、速度、加速度、jerk、yaw期望
 				des = get_cmd_des();
 				ROS_INFO("\033[32m[px4ctrl] AUTO_HOVER(L2) --> CMD_CTRL(L3)\033[32m");
 			}
 		}
+		//自动起飞命令触发，起飞降落命令为降落
 		else if (takeoff_land_data.triggered && takeoff_land_data.takeoff_land_cmd == quadrotor_msgs::TakeoffLand::LAND)
 		{
 
 			state = AUTO_LAND;
+			//设置降落的起始位姿
 			set_start_pose_for_takeoff_land(odom_data);
 
 			ROS_INFO("\033[32m[px4ctrl] AUTO_HOVER(L2) --> AUTO_LAND\033[32m");
 		}
 		else
 		{
+			//从遥控器接收期望控制量
 			set_hov_with_rc();
 			des = get_hover_des();
+			//如果6通道在最下面或使能自动起飞/降落延迟触发
 			if ((rc_data.enter_command_mode) ||
 				(takeoff_land.delay_trigger.first && now_time > takeoff_land.delay_trigger.second))
 			{
@@ -205,11 +233,13 @@ void PX4CtrlFSM::process()
 			des = get_hover_des();
 			ROS_INFO("[px4ctrl] From CMD_CTRL(L3) to AUTO_HOVER(L2)!");
 		}
+		//5、6通道都在最下面（进入offborad且能收到指令），/position_cmd不断地发控制命令
 		else
 		{
 			des = get_cmd_des();
 		}
 
+		//自动起飞降落命令被触发
 		if (takeoff_land_data.triggered && takeoff_land_data.takeoff_land_cmd == quadrotor_msgs::TakeoffLand::LAND)
 		{
 			ROS_ERROR("[px4ctrl] Reject AUTO_LAND, which must be triggered in AUTO_HOVER. \
@@ -222,16 +252,19 @@ void PX4CtrlFSM::process()
 
 	case AUTO_TAKEOFF:
 	{
+		//刚收到自动起飞命令的前几秒怠速（电机最小转速）
 		if ((now_time - takeoff_land.toggle_takeoff_land_time).toSec() < AutoTakeoffLand_t::MOTORS_SPEEDUP_TIME) // Wait for several seconds to warn prople.
 		{
 			des = get_rotor_speed_up_des(now_time);
 		}
+		//起飞高度超过设置的悬停高度
 		else if (odom_data.p(2) >= (takeoff_land.start_pose(2) + param.takeoff_land.height)) // reach the desired height
 		{
 			state = AUTO_HOVER;
+			//从里程计获得当前位姿作为悬停位姿
 			set_hov_with_odom();
 			ROS_INFO("\033[32m[px4ctrl] AUTO_TAKEOFF --> AUTO_HOVER(L2)\033[32m");
-
+			//使能并设置触发延迟
 			takeoff_land.delay_trigger.first = true;
 			takeoff_land.delay_trigger.second = now_time + ros::Duration(AutoTakeoffLand_t::DELAY_TRIGGER_TIME);
 		}
@@ -259,6 +292,7 @@ void PX4CtrlFSM::process()
 			des = get_hover_des();
 			ROS_INFO("[px4ctrl] From AUTO_LAND to AUTO_HOVER(L2)!");
 		}
+		//还没降落
 		else if (!get_landed())
 		{
 			des = get_takeoff_land_des(-param.takeoff_land.speed);
@@ -274,6 +308,7 @@ void PX4CtrlFSM::process()
 				print_once_flag = false;
 			}
 
+			//px4拓展状态为着陆状态
 			if (extended_state_data.current_extended_state.landed_state == mavros_msgs::ExtendedState::LANDED_STATE_ON_GROUND) // PX4 allows disarm after this
 			{
 				static double last_trial_time = 0; // Avoid too frequent calls
@@ -282,6 +317,7 @@ void PX4CtrlFSM::process()
 					if (toggle_arm_disarm(false)) // disarm
 					{
 						print_once_flag = true;
+						//给px4上锁，退出offboard模式
 						state = MANUAL_CTRL;
 						toggle_offboard_mode(false); // toggle off offboard after disarm
 						ROS_INFO("\033[32m[px4ctrl] AUTO_LAND --> MANUAL_CTRL(L1)\033[32m");
@@ -300,6 +336,7 @@ void PX4CtrlFSM::process()
 	}
 
 	// STEP2: estimate thrust model
+	//估计油门推力有两种模式，一种悬停下的油门推力，一种轨迹跟踪下的油门推力
 	if (state == AUTO_HOVER || state == CMD_CTRL)
 	{
 		// controller.estimateThrustModel(imu_data.a, bat_data.volt, param);
@@ -308,12 +345,14 @@ void PX4CtrlFSM::process()
 	}
 
 	// STEP3: solve and update new control commands
+	//更新控制指令
 	if (rotor_low_speed_during_land) // used at the start of auto takeoff
 	{
-		motors_idling(imu_data, u);
+		motors_idling(imu_data, u); //电机怠速
 	}
 	else
 	{
+		//更新控制指令并记录发送
 		debug_msg = controller.calculateControl(des, odom_data, imu_data, u);
 		debug_msg.header.stamp = now_time;
 		debug_pub.publish(debug_msg);
@@ -330,6 +369,7 @@ void PX4CtrlFSM::process()
 	}
 
 	// STEP5: Detect if the drone has landed
+	//检测是否落地
 	land_detector(state, des, odom_data);
 	// cout << takeoff_land.landed << " ";
 	// fflush(stdout);
@@ -364,6 +404,10 @@ void PX4CtrlFSM::land_detector(const State_t state, const Desired_State_t &des, 
 	}
 
 	// land_detector parameters
+	// 降落检测三个条件：
+	//1.目标位置和实际位置范围在0.5m范围以内
+    //2.速度限定在0.1m/s以内
+	//3.上述条件需满足 3s以上
 	constexpr double POSITION_DEVIATION_C = -0.5; // Constraint 1: target position below real position for POSITION_DEVIATION_C meters.
 	constexpr double VELOCITY_THR_C = 0.1;		  // Constraint 2: velocity below VELOCITY_MIN_C m/s.
 	constexpr double TIME_KEEP_C = 3.0;			  // Constraint 3: Time(s) the Constraint 1&2 need to keep.
